@@ -33,9 +33,15 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include "web_interface.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
+#ifdef WIFI_NETWORKS_DEFINED
+#pragma message "secrets.h loaded OK"
+#else
+#pragma message "secrets.h NOT found - will use hotspot"
+#endif
 #endif
 #endif
 
@@ -53,15 +59,6 @@
 #define ENABLE_PIN 4
 #endif
 
-// WiFi credentials (for web server mode)
-#ifndef WIFI_SSID
-#define WIFI_SSID "YourSSID"
-#endif
-
-#ifndef WIFI_PASS
-#define WIFI_PASS "YourPassword"
-#endif
-
 // Nibble swap helper
 #define SWAP_NIBBLES(x) (((x) & 0x0F) << 4 | ((x) & 0xF0) >> 4)
 
@@ -70,6 +67,7 @@ OneWire<ONEWIRE_PIN> makita;
 
 #ifdef ENABLE_WEB_SERVER
 WebServer server(80);
+bool wifiHotspot = false;  // true if running in hotspot/AP mode
 #endif
 
 // Battery data structure
@@ -105,6 +103,7 @@ bool readBatteryModel();
 #ifdef ENABLE_WEB_SERVER
 void setupWebServer();
 void setupOTA();
+void setupWiFi();
 #endif
 
 // ------------------------------------------------------------------
@@ -134,27 +133,12 @@ void setup() {
 
 #ifdef ENABLE_WEB_SERVER
     Serial.println("Mode: Web Server + Serial Bridge");
-    Serial.println("Connecting to WiFi...");
-
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
+    setupWiFi();
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println();
-        Serial.print("Connected! IP: ");
-        Serial.println(WiFi.localIP());
         setupOTA();
-        setupWebServer();
-    } else {
-        Serial.println();
-        Serial.println("WiFi failed - Serial bridge only");
     }
+    setupWebServer();
 #else
     Serial.println("Mode: Serial Bridge Only");
 #endif
@@ -167,11 +151,93 @@ void setup() {
 // ------------------------------------------------------------------
 void loop() {
 #ifdef ENABLE_WEB_SERVER
-    ArduinoOTA.handle();
+    if (!wifiHotspot) {
+        ArduinoOTA.handle();
+    }
     server.handleClient();
 #endif
     processSerialCommand();
 }
+
+// ------------------------------------------------------------------
+// WiFi Setup - multi-network with hotspot fallback
+// ------------------------------------------------------------------
+#ifdef ENABLE_WEB_SERVER
+void setupWiFi() {
+
+#ifdef WIFI_NETWORKS_DEFINED
+    // Scan for available networks
+    Serial.println("Scanning for WiFi networks...");
+    int found = WiFi.scanNetworks();
+    Serial.printf("Found %d networks\n", found);
+
+    // Try to match a known network from secrets.h
+    const char* matchedSSID = nullptr;
+    const char* matchedPass = nullptr;
+
+    for (int i = 0; i < found && matchedSSID == nullptr; i++) {
+        String scannedSSID = WiFi.SSID(i);
+        for (int j = 0; j < WIFI_NETWORK_COUNT; j++) {
+            if (scannedSSID == WIFI_NETWORKS[j].ssid) {
+                matchedSSID = WIFI_NETWORKS[j].ssid;
+                matchedPass = WIFI_NETWORKS[j].pass;
+                Serial.printf("Matched network: %s\n", matchedSSID);
+                break;
+            }
+        }
+    }
+    WiFi.scanDelete();
+
+    if (matchedSSID != nullptr) {
+        // Connect to matched network
+        Serial.printf("Connecting to %s", matchedSSID);
+        WiFi.begin(matchedSSID, matchedPass);
+
+        unsigned long startMs = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_TIMEOUT_MS) {
+            delay(500);
+            Serial.print(".");
+        }
+        Serial.println();
+    }
+#endif
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiHotspot = false;
+        Serial.print("Connected! IP: ");
+        Serial.println(WiFi.localIP());
+
+        if (MDNS.begin("obi-esp32")) {
+            Serial.println("mDNS started - http://obi-esp32.local");
+        }
+
+    } else {
+        // No known network found or connection timed out — start hotspot
+        wifiHotspot = true;
+        WiFi.mode(WIFI_AP);
+
+        bool apStarted;
+        if (strlen(HOTSPOT_PASS) > 0) {
+            apStarted = WiFi.softAP(HOTSPOT_SSID, HOTSPOT_PASS);
+        } else {
+            apStarted = WiFi.softAP(HOTSPOT_SSID);
+        }
+
+        if (apStarted) {
+            Serial.printf("Hotspot started - SSID: %s\n", HOTSPOT_SSID);
+            if (strlen(HOTSPOT_PASS) > 0) {
+                Serial.printf("Hotspot password: %s\n", HOTSPOT_PASS);
+            } else {
+                Serial.println("Hotspot is open (no password)");
+            }
+            Serial.print("Hotspot IP: ");
+            Serial.println(WiFi.softAPIP());
+        } else {
+            Serial.println("ERROR: Failed to start hotspot");
+        }
+    }
+}
+#endif
 
 // ------------------------------------------------------------------
 // Enable pin control
@@ -406,7 +472,6 @@ bool readBatteryVoltages() {
         }
 
         if (f0513_ok) {
-            // Calculate pack voltage and diff
             float sum = 0, maxV = 0, minV = 5;
             for (int i = 0; i < 5; i++) {
                 sum += batteryData.cellVoltage[i];
@@ -416,11 +481,10 @@ bool readBatteryVoltages() {
             batteryData.packVoltage = sum;
             batteryData.cellDiff = maxV - minV;
 
-            // Temperature (F0513 only has cell temp, no MOSFET temp)
             vcmd[0] = 0x52;
             if (cmdAndReadCC(vcmd, 1, rsp, 2)) {
                 batteryData.tempCell = ((uint16_t)rsp[0] | ((uint16_t)rsp[1] << 8)) / 100.0f;
-                batteryData.tempMosfet = 0;  // Not available on F0513
+                batteryData.tempMosfet = 0;
             }
             success = true;
         }
@@ -551,7 +615,7 @@ void setupOTA() {
 #endif
 
 // ------------------------------------------------------------------
-// Web Server (Phase 2)
+// Web Server
 // ------------------------------------------------------------------
 
 #ifdef ENABLE_WEB_SERVER
@@ -613,12 +677,10 @@ void handleApiLeds() {
     setEnable(true);
     delay(400);
 
-    // Test mode command
     byte cmd1[] = {0xD9, 0x96, 0xA5};
     byte rsp[32];
     cmdAndRead33(cmd1, 3, rsp, 9);
 
-    // LED command
     byte cmd2[] = {0xDA, (byte)(state ? 0x31 : 0x34)};
     cmdAndRead33(cmd2, 2, rsp, 9);
 
@@ -631,12 +693,10 @@ void handleApiReset() {
     setEnable(true);
     delay(400);
 
-    // Test mode
     byte cmd1[] = {0xD9, 0x96, 0xA5};
     byte rsp[32];
     cmdAndRead33(cmd1, 3, rsp, 9);
 
-    // Reset error
     byte cmd2[] = {0xDA, 0x04};
     cmdAndRead33(cmd2, 2, rsp, 9);
 
@@ -654,5 +714,11 @@ void setupWebServer() {
 
     server.begin();
     Serial.println("Web server started on port 80");
+
+    if (wifiHotspot) {
+        Serial.printf("Connect to hotspot '%s' then browse to http://192.168.4.1\n", HOTSPOT_SSID);
+    } else {
+        Serial.println("Browse to http://obi-esp32.local");
+    }
 }
 #endif
