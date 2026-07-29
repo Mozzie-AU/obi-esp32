@@ -34,6 +34,7 @@
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
+#include <DNSServer.h>
 #include "web_interface.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -67,6 +68,7 @@ OneWire<ONEWIRE_PIN> makita;
 
 #ifdef ENABLE_WEB_SERVER
 WebServer server(80);
+DNSServer dnsServer;
 bool wifiHotspot = false;  // true if running in hotspot/AP mode
 #endif
 
@@ -151,7 +153,9 @@ void setup() {
 // ------------------------------------------------------------------
 void loop() {
 #ifdef ENABLE_WEB_SERVER
-    if (!wifiHotspot) {
+    if (wifiHotspot) {
+        dnsServer.processNextRequest();
+    } else {
         ArduinoOTA.handle();
     }
     server.handleClient();
@@ -224,6 +228,10 @@ void setupWiFi() {
         }
 
         if (apStarted) {
+            // Start DNS server - redirect all DNS queries to our IP
+            // This triggers the captive portal on Android, iOS, Windows, macOS
+            dnsServer.start(53, "*", WiFi.softAPIP());
+
             Serial.printf("Hotspot started - SSID: %s\n", HOTSPOT_SSID);
             if (strlen(HOTSPOT_PASS) > 0) {
                 Serial.printf("Hotspot password: %s\n", HOTSPOT_PASS);
@@ -232,6 +240,7 @@ void setupWiFi() {
             }
             Serial.print("Hotspot IP: ");
             Serial.println(WiFi.softAPIP());
+            Serial.println("Captive portal active - browser should open automatically");
         } else {
             Serial.println("ERROR: Failed to start hotspot");
         }
@@ -705,12 +714,29 @@ void handleApiReset() {
     server.send(200, "application/json", "{\"success\":true}");
 }
 
+void handleCaptivePortal() {
+    // Redirect to root - works for all captive portal detection methods
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
+}
+
 void setupWebServer() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/read", HTTP_GET, handleApiRead);
     server.on("/api/voltages", HTTP_GET, handleApiVoltages);
     server.on("/api/leds", HTTP_GET, handleApiLeds);
     server.on("/api/reset", HTTP_GET, handleApiReset);
+
+    if (wifiHotspot) {
+        // Captive portal detection endpoints for each OS
+        server.on("/generate_204", HTTP_GET, handleCaptivePortal);           // Android
+        server.on("/gen_204", HTTP_GET, handleCaptivePortal);                // Android fallback
+        server.on("/hotspot-detect.html", HTTP_GET, handleCaptivePortal);   // iOS / macOS
+        server.on("/connecttest.txt", HTTP_GET, handleCaptivePortal);        // Windows
+        server.on("/redirect", HTTP_GET, handleCaptivePortal);               // Windows fallback
+        server.on("/success.txt", HTTP_GET, handleCaptivePortal);            // Firefox
+        server.onNotFound(handleCaptivePortal);  // Catch-all for any other probe URLs
+    }
 
     server.begin();
     Serial.println("Web server started on port 80");
