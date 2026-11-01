@@ -127,14 +127,14 @@ uint8_t read_bit(void)
 void write(uint8_t v) {
     delayMicroseconds(90);
     for (uint8_t writeNMask = 0x01; writeNMask; writeNMask <<= 1) {
-	        OneWire::write_bit( (writeNMask & v)?1:0);
+	    OneWire::write_bit( (writeNMask & v)?1:0);
     }
 }
 
 void write_bytes(const uint8_t *buf, uint16_t count) {
-  for (uint16_t i = 0 ; i < count ; i++)
-    write(buf[i]);
-
+	for (uint16_t i = 0 ; i < count ; i++) {
+		write(buf[i]);
+	}
     DIRECT_MODE_INPUT(baseReg, bitmask);
     DIRECT_WRITE_LOW(baseReg, bitmask);  
 }
